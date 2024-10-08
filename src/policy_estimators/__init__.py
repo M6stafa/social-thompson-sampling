@@ -1,2 +1,2 @@
-from .policy_estimator import PolicyEstimator
-from .ewm_policy_estimator import EWMPolicyEstimator
+from .base import BasePolicyEstimator
+from .ewm import EWMPolicyEstimator

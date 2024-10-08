@@ -9,11 +9,95 @@ import plotly.graph_objects as go
 from scipy import stats
 from tqdm import tqdm
 
-from run import EXPERIMENTS, N_ARMS
-
 
 # CONSTANTS
 PLOTS_BASE_PATH = Path(__file__).parent.resolve() / 'plots'
+
+
+# helper functions
+def hex_to_rgba(h, alpha):
+    return f'rgba{tuple([int(h.lstrip("#")[i:i+2], 16) for i in (0, 2, 4)] + [alpha])}'
+
+
+def create_lines_fig(
+    x,
+    means_stds: dict[str, tuple[np.ndarray, np.ndarray]],
+    title='',
+    xaxis_title='',
+    yaxis_title='',
+    x_max: int|None = None,
+    reduce_x: int = 0,
+):
+    x_max = len(x) if x_max is None else x_max
+    x = x[:x_max]
+
+    if reduce_x > 0:
+        x_indexes = np.arange(0, len(x), reduce_x, dtype=int).tolist()
+    else:
+        x_indexes = np.arange(len(x), dtype=int).tolist()
+    if x_indexes[-1] != (len(x) - 1):
+        x_indexes.append(len(x) - 1)
+
+    x = np.take(x, x_indexes).tolist()
+
+    color_i = 0
+    colors = px.colors.qualitative.Plotly
+
+    fig = go.Figure()
+
+    for name, (means, stds) in means_stds.items():
+        cis = 1.96 * stds
+
+        line_color = hex_to_rgba(colors[color_i], 1.0)
+        fill_color = hex_to_rgba(colors[color_i], 0.2)
+
+        fig.add_traces([
+            go.Scatter(
+                x = x,
+                y = means,
+                line = dict(color=line_color),
+                mode = 'lines',
+                name = name,
+                legendgroup = name,
+            ),
+            go.Scatter(
+                x = x + x[::-1],
+                y = list(means + cis) + list(means - cis)[::-1],
+                fill = 'toself',
+                fillcolor = fill_color,
+                line = dict(color='rgba(0, 0, 0, 0)', dash='dot'),
+                hoverinfo = 'skip',
+                showlegend = False,
+                legendgroup = name,
+            ),
+            go.Scatter(
+                x = x,
+                y = list(means + cis),
+                line = dict(color=fill_color, dash='dot'),
+                hoverinfo = 'skip',
+                showlegend = False,
+                legendgroup = name,
+            ),
+            go.Scatter(
+                x = x,
+                y = list(means - cis),
+                line = dict(color=fill_color, dash='dot'),
+                hoverinfo = 'skip',
+                showlegend = False,
+                legendgroup = name,
+            ),
+        ])
+
+        color_i += 1
+        color_i %= len(colors)
+
+    fig.update_layout(
+        title = title,
+        xaxis_title = xaxis_title,
+        yaxis_title = yaxis_title,
+    )
+
+    return fig
 
 
 # Get logs base path from cmd
@@ -22,7 +106,7 @@ parser.add_argument('logs_dir')
 
 args = parser.parse_args()
 
-logs_path = Path(args.logs_dir).resolve(strict=True)
+logs_path = Path(args.logs_dir).resolve(strict=True).absolute()
 
 # plots path
 plots_path = PLOTS_BASE_PATH / logs_path.name
@@ -34,12 +118,8 @@ print('Ploting regrets...')
 with open(logs_path / 'regrets.pkl', 'rb') as f:
     regrets = pickle.load(f)
 
-fig = go.Figure([go.Scatter(
-    x = np.arange(len(regrets_mean)) + 1,
-    y = regrets_mean,
-    name = name,
-    # line_dash = 'dash' if name.endswith(('+ TS', '+ e-Greedy', '+ UCB')) else 'solid',
-) for name, (regrets_mean, _) in regrets.items()])
+# TODO: read horizon from config
+fig = create_lines_fig(np.arange(1000) + 1, regrets)
 
 fig.update_layout(
     xaxis_title = 't',
@@ -53,7 +133,7 @@ print('Ploting policy estimators...')
 with open(logs_path / 'policy_estimators_logs.pkl', 'rb') as f:
     pe_logs = pickle.load(f)
 
-log_steps = 5
+log_steps = 4
 pe_data = []
 for agent_name, policy_estimations in pe_logs.items():
     for t, hist in enumerate(policy_estimations[0]):
@@ -93,23 +173,23 @@ for agent_name, agent_logs in tqdm(agents_logs.items(), desc='Ploting agents\' d
     if (type(agent_logs) is not dict) or ('agent_norm_dists' not in agent_logs):
         continue
 
-    agent_dists_log = agent_logs['agent_norm_dists']
-    agent_dists_names = ['STS'] + EXPERIMENTS[agent_name[6:]]
+    agent_norm_dists: list[dict[str, tuple[float, float]]] = agent_logs['agent_norm_dists']
 
     data_pdf = []
     data_selection_probs = []
 
-    for t in range(0, len(agent_dists_log), log_steps):
+    for t in np.linspace(0, len(agent_norm_dists) - 1, num=len(agent_norm_dists) // log_steps, dtype=int):
+        agent_dists_names = list(agent_norm_dists[t].keys())
         new_samples = []
 
         for i, name in enumerate(agent_dists_names):
-            mean, std = agent_dists_log[t][i]
+            mean, std = agent_norm_dists[t][name]
             agent_dist = stats.norm(loc=mean, scale=std)
 
             pdf_values = agent_dist.pdf(x_dist)
 
             for x, v in zip(x_dist, pdf_values):
-                data_pdf.append((name, t, x, v))
+                data_pdf.append((name, t + 1, x, v))
 
             new_samples.append(agent_dist.rvs(size=n_samples))
 
@@ -117,7 +197,7 @@ for agent_name, agent_logs in tqdm(agents_logs.items(), desc='Ploting agents\' d
         selection_probs = selection_probs / np.sum(selection_probs)
 
         for name, prob in zip(agent_dists_names, selection_probs):
-            data_selection_probs.append((name, t, prob))
+            data_selection_probs.append((name, t + 1, prob))
 
     df_pdf = pd.DataFrame(data_pdf, columns=['Agent', 't', 'x', 'PDF'])
     fig = px.line(
@@ -154,30 +234,31 @@ for agent_name, agent_logs in tqdm(agents_logs.items(), desc='Ploting agents\' d
         include_plotlyjs = 'directory',
     )
 
+
 # Action's dist
-for agent_name, agent_logs in tqdm(agents_logs.items(), desc='Ploting action\'s dist'):
+for agent_name, agent_logs in tqdm(agents_logs.items(), desc='Ploting actions\' dist'):
     agent_logs = agent_logs[0]
 
     if (type(agent_logs) is not dict) or ('action_beta_dists' not in agent_logs):
         continue
 
-    action_dists_log = agent_logs['action_beta_dists']
-    action_dists_names = [str(i) for i in range(N_ARMS)]
+    action_beta_dists = agent_logs['action_beta_dists']
+    action_dists_names = [str(i) for i in range(len(action_beta_dists[0]))]
 
     data_pdf = []
     data_selection_probs = []
 
-    for t in range(0, len(action_dists_log), log_steps):
+    for t in np.linspace(0, len(action_beta_dists) - 1, num=len(action_beta_dists) // log_steps, dtype=int):
         new_samples = []
 
         for i, name in enumerate(action_dists_names):
-            a, b = action_dists_log[t][i]
+            a, b = action_beta_dists[t][i]
             action_dist = stats.beta(a, b)
 
             pdf_values = action_dist.pdf(x_dist)
 
             for x, v in zip(x_dist, pdf_values):
-                data_pdf.append((name, t, x, v))
+                data_pdf.append((name, t + 1, x, v))
 
             new_samples.append(action_dist.rvs(size=n_samples))
 
@@ -185,7 +266,7 @@ for agent_name, agent_logs in tqdm(agents_logs.items(), desc='Ploting action\'s 
         selection_probs = selection_probs / np.sum(selection_probs)
 
         for name, prob in zip(action_dists_names, selection_probs):
-            data_selection_probs.append((name, t, prob))
+            data_selection_probs.append((name, t + 1, prob))
 
     df_pdf = pd.DataFrame(data_pdf, columns=['Action', 't', 'x', 'PDF'])
     fig = px.line(
